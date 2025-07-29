@@ -10,11 +10,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import ac.marshall.vibeactivator.ui.theme.VibeActivatorTheme
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import ac.marshall.vibeactivator.ui.theme.VibeActivatorTheme
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -25,12 +33,77 @@ class MainActivity : ComponentActivity() {
         setContent {
             VibeActivatorTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    TonePanel()
+                    VibeActivatorApp()
                 }
             }
         }
     }
 }
+
+@Composable
+fun VibeActivatorApp() {
+    var isActivationTriggered by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        launch(Dispatchers.IO) {
+            embeddedServer(Netty, port = 8080) {
+                routing {
+                    get("/trigger") {
+                        call.respondText("Activation triggered")
+                        withContext(Dispatchers.Main) {
+                            isActivationTriggered = true
+                        }
+                    }
+                }
+            }.start(wait = true)
+        }
+    }
+
+    if (isActivationTriggered) {
+        ActivationScreen(onFinish = { isActivationTriggered = false })
+    } else {
+        TonePanel()
+    }
+}
+
+@Composable
+fun ActivationScreen(onFinish: () -> Unit) {
+    var secondsLeft by remember { mutableIntStateOf(10) }
+
+    LaunchedEffect(Unit) {
+        launch(Dispatchers.IO) {
+            playTone(ToneKind.LEFT_ONLY, 10_000)
+        }
+
+        launch {
+            for (i in 10 downTo 1) {
+                secondsLeft = i
+                delay(1_000)
+            }
+            onFinish()
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            "SOUND ACTIVATION TRIGGERED",
+            color = Color.Red,
+            style = MaterialTheme.typography.headlineMedium
+        )
+        Spacer(modifier = Modifier.height(32.dp))
+        Text(
+            text = "$secondsLeft",
+            style = MaterialTheme.typography.displayLarge.copy(
+                fontWeight = FontWeight.Bold
+            )
+        )
+    }
+}
+
 
 /* ---------- UI ---------- */
 
@@ -98,7 +171,7 @@ fun TonePanel() {
             modifier = Modifier.fillMaxWidth()
         ) { Text("Left-only 1kHz sine") }
 
-        Button(
+
             onClick = { launchTone(ToneKind.SINE_RIGHT_ONLY) },
             enabled = !isBusy,
             modifier = Modifier.fillMaxWidth()
@@ -129,43 +202,43 @@ private enum class ToneKind { LEFT_ONLY, RIGHT_ONLY, OPPOSITE_PHASE, INVERTED_PH
  * - OPPOSITE_PHASE: L = +FS/-FS, R = +FS/-FS  (Same phase)
  * - INVERTED_PHASE: L = +FS/-FS, R = -FS/+FS  (Opposite phase)
  */
-private suspend fun playTone(kind: ToneKind, millis: Int) {
-    val fs = 48_000                      // sample rate
-    val freq = 1_000                     // 1 kHz
-    val periodInFrames = fs / freq       // period in samples
+private suspend fun playTone(kind: ToneKind, durationMillis: Int) {
+    val sampleRate = 48000
+    val freq = 1000.0
+    val periodInSamples = (sampleRate / freq).toInt()
 
-    // The buffer must contain an integer number of cycles.
-    // The original `fs / 60` (~16.7ms) does not, causing a phase jump on loop.
-    val frameCount = periodInFrames * 16 // 16 cycles -> 768 frames
-    val bufStereo = ShortArray(frameCount * 2)
-    for (i in 0 until frameCount) {
-        val sample = if (kind.name.contains("SINE")) {
-            (Short.MAX_VALUE * kotlin.math.sin(2 * kotlin.math.PI * freq * i / fs)).toInt().toShort()
+    val numSamples = (durationMillis / 1000.0 * sampleRate).toInt()
+    val buffer = ShortArray(numSamples * 2) // For stereo
+
+    for (i in 0 until numSamples) {
+        val angle = 2.0 * Math.PI * i / periodInSamples
+        val sampleValue = if (kind.name.contains("SINE")) {
+            (Math.sin(angle) * Short.MAX_VALUE).toInt().toShort()
         } else {
-            val samplesIntoCycle = i % periodInFrames
-            if (samplesIntoCycle < periodInFrames / 2) Short.MAX_VALUE else Short.MIN_VALUE
+            if (angle % (2.0 * Math.PI) < Math.PI) Short.MAX_VALUE else Short.MIN_VALUE
         }
+
         when (kind) {
             ToneKind.LEFT_ONLY, ToneKind.SINE_LEFT_ONLY -> {
-                bufStereo[2 * i] = sample
-                bufStereo[2 * i + 1] = 0
+                buffer[i * 2] = sampleValue
+                buffer[i * 2 + 1] = 0
             }
             ToneKind.RIGHT_ONLY, ToneKind.SINE_RIGHT_ONLY -> {
-                bufStereo[2 * i] = 0
-                bufStereo[2 * i + 1] = sample
+                buffer[i * 2] = 0
+                buffer[i * 2 + 1] = sampleValue
             }
             ToneKind.OPPOSITE_PHASE, ToneKind.SINE_BOTH -> {
-                bufStereo[2 * i] = sample
-                bufStereo[2 * i + 1] = sample
+                buffer[i * 2] = sampleValue
+                buffer[i * 2 + 1] = sampleValue
             }
             ToneKind.INVERTED_PHASE -> {
-                bufStereo[2 * i] = sample
-                bufStereo[2 * i + 1] = (-sample.toInt()).toShort()
+                buffer[i * 2] = sampleValue
+                buffer[i * 2 + 1] = (-sampleValue.toInt()).toShort()
             }
         }
     }
 
-    val track = AudioTrack.Builder()
+    val audioTrack = AudioTrack.Builder()
         .setAudioAttributes(
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -175,20 +248,19 @@ private suspend fun playTone(kind: ToneKind, millis: Int) {
         .setAudioFormat(
             AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(fs)
+                .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                 .build()
         )
         .setTransferMode(AudioTrack.MODE_STATIC)
-        .setBufferSizeInBytes(bufStereo.size * 2)   // 2 bytes per short
+        .setBufferSizeInBytes(buffer.size * 2)
         .build()
 
-    track.write(bufStereo, 0, bufStereo.size)
-    track.setLoopPoints(0, frameCount, -1)          // loop forever
-    track.play()
+    audioTrack.write(buffer, 0, buffer.size)
+    audioTrack.play()
 
-    delay(millis.toLong())
+    delay(durationMillis.toLong())
 
-    track.stop()
-    track.release()
+    audioTrack.stop()
+    audioTrack.release()
 }
